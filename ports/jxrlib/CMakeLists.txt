@@ -8,6 +8,9 @@ project(jxrlib C)
 # Need shared libs for ABI
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 
+# Add a debug postfix
+set(CMAKE_DEBUG_POSTFIX "d")
+
 # helper macro to preserve original Makefile convention
 macro(JXR_MAKE_OBJ SET_NAME)
   foreach(src ${SRC_${SET_NAME}})
@@ -59,7 +62,7 @@ JXR_MAKE_OBJ(ENC)
 
 add_library(jpegxr ${OBJ_ENC} ${OBJ_DEC} ${OBJ_SYS})
 set_property(TARGET jpegxr
-  PROPERTY COMPILE_DEFINITIONS __ANSI__ DISABLE_PERF_MEASUREMENT ${DEF_ENDIAN}
+  PROPERTY COMPILE_DEFINITIONS DISABLE_PERF_MEASUREMENT ${DEF_ENDIAN}
 )
 set_property(TARGET jpegxr PROPERTY LINK_INTERFACE_LIBRARIES "")
 install(TARGETS jpegxr
@@ -77,7 +80,7 @@ JXR_MAKE_OBJ(TEST)
 
 add_library(jxrglue ${OBJ_GLUE} ${OBJ_TEST})
 set_property(TARGET jxrglue
-  PROPERTY COMPILE_DEFINITIONS __ANSI__ DISABLE_PERF_MEASUREMENT ${DEF_ENDIAN}
+  PROPERTY COMPILE_DEFINITIONS DISABLE_PERF_MEASUREMENT ${DEF_ENDIAN}
 )
 set_property(TARGET jxrglue PROPERTY LINK_INTERFACE_LIBRARIES "")
 install(TARGETS jxrglue

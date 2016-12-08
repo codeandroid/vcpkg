@@ -3,22 +3,14 @@
     set(VCPKG_LIBRARY_LINKAGE dynamic)
 endif()
 include(vcpkg_common_functions)
-find_program(POWERSHELL powershell)
 
-set(SOURCE_PATH ${CURRENT_BUILDTREES_DIR}/src/ChakraCore-1.2.0.0)
+set(SOURCE_PATH ${CURRENT_BUILDTREES_DIR}/src/ChakraCore-1.3.1)
 vcpkg_download_distfile(ARCHIVE_FILE
-    URLS "https://github.com/Microsoft/ChakraCore/archive/v1.2.0.0.tar.gz"
-    FILENAME "ChakraCore-1.2.0.0.tar.gz"
-    SHA512 53e487028a30605a4e2589c40b65da060ca4884617fdba8877557e4db75f911be4433d260132cce3526647622bdc742a0aacda1443a16dfed3d3fdd442539528
+    URLS "https://github.com/Microsoft/ChakraCore/archive/v1.3.1.tar.gz"
+    FILENAME "ChakraCore-1.3.1.tar.gz"
+    SHA512 52216a03333e44bce235917cfae5ccd6a756056678d9b81c63ec272d9ce5c6afabc673e7910dd3da54fda7927ea62ede980a4371dbb08f6ce4907121c27dbc53
 )
 vcpkg_extract_source_archive(${ARCHIVE_FILE})
-
-message(STATUS "Patching JavascriptPromise.cpp for https://github.com/Microsoft/ChakraCore/issues/1429")
-vcpkg_execute_required_process(
-	COMMAND ${POWERSHELL} -command (gc lib/runtime/library/JavascriptPromise.cpp -encoding utf7) -replace('«', '^<^<') -replace('»', '^>^>') | Set-Content lib/runtime/library/JavascriptPromise.cpp
-	WORKING_DIRECTORY ${SOURCE_PATH}
-)
-message(STATUS "Patching done.")
 
 vcpkg_build_msbuild(
     PROJECT_PATH ${SOURCE_PATH}/Build/Chakra.Core.sln

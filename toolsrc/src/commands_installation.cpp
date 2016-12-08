@@ -9,29 +9,31 @@
 #include "vcpkg_Dependencies.h"
 #include "vcpkg_Input.h"
 #include "vcpkg_Maps.h"
-#include "Paragraphs.h"
 #include "vcpkg_info.h"
 
 namespace vcpkg
 {
+    using Dependencies::package_spec_with_install_plan;
+    using Dependencies::install_plan_type;
+
+    static const std::string OPTION_CHECKS_ONLY = "--checks-only";
+
     static void create_binary_control_file(const vcpkg_paths& paths, const SourceParagraph& source_paragraph, const triplet& target_triplet)
     {
-        auto bpgh = BinaryParagraph(source_paragraph, target_triplet);
+        const BinaryParagraph bpgh = BinaryParagraph(source_paragraph, target_triplet);
         const fs::path binary_control_file = paths.packages / bpgh.dir() / "CONTROL";
         std::ofstream(binary_control_file) << bpgh;
     }
 
-    static void build_internal(const package_spec& spec, const vcpkg_paths& paths, const fs::path& port_dir)
+    static void build_internal(const SourceParagraph& source_paragraph, const package_spec& spec, const vcpkg_paths& paths, const fs::path& port_dir)
     {
-        auto pghs = Paragraphs::get_paragraphs(port_dir / "CONTROL");
-        Checks::check_exit(pghs.size() == 1, "Error: invalid control file");
-        SourceParagraph source_paragraph(pghs[0]);
+        Checks::check_exit(spec.name() == source_paragraph.name, "inconsistent arguments to build_internal()");
+        const triplet& target_triplet = spec.target_triplet();
 
         const fs::path ports_cmake_script_path = paths.ports_cmake;
-        auto&& target_triplet = spec.target_triplet();
         const std::wstring command = Strings::wformat(LR"("%%VS140COMNTOOLS%%..\..\VC\vcvarsall.bat" %s && cmake -DCMD=BUILD -DPORT=%s -DTARGET_TRIPLET=%s "-DCURRENT_PORT_DIR=%s/." -P "%s")",
                                                       Strings::utf8_to_utf16(target_triplet.architecture()),
-                                                      Strings::utf8_to_utf16(spec.name()),
+                                                      Strings::utf8_to_utf16(source_paragraph.name),
                                                       Strings::utf8_to_utf16(target_triplet.canonical_name()),
                                                       port_dir.generic_wstring(),
                                                       ports_cmake_script_path.generic_wstring());
@@ -57,7 +59,7 @@ namespace vcpkg
             exit(EXIT_FAILURE);
         }
 
-        perform_all_checks(spec, paths);
+        PostBuildLint::perform_all_checks(spec, paths);
 
         create_binary_control_file(paths, source_paragraph, target_triplet);
 
@@ -65,9 +67,150 @@ namespace vcpkg
         // delete_directory(port_buildtrees_dir);
     }
 
-    static void build_internal(const package_spec& spec, const vcpkg_paths& paths)
+    static void install_and_write_listfile(const vcpkg_paths& paths, const BinaryParagraph& bpgh)
     {
-        return build_internal(spec, paths, paths.ports / spec.name());
+        std::fstream listfile(paths.listfile_path(bpgh), std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
+
+        auto package_prefix_path = paths.package_dir(bpgh.spec);
+        auto prefix_length = package_prefix_path.native().size();
+
+        const triplet& target_triplet = bpgh.spec.target_triplet();
+        const std::string& target_triplet_as_string = target_triplet.canonical_name();
+        std::error_code ec;
+        fs::create_directory(paths.installed / target_triplet_as_string, ec);
+        listfile << target_triplet << "\n";
+
+        for (auto it = fs::recursive_directory_iterator(package_prefix_path); it != fs::recursive_directory_iterator(); ++it)
+        {
+            const std::string filename = it->path().filename().generic_string();
+            if (fs::is_regular_file(it->status()) && (_stricmp(filename.c_str(), "CONTROL") == 0 || _stricmp(filename.c_str(), "BUILD_INFO") == 0))
+            {
+                // Do not copy the control file
+                continue;
+            }
+
+            auto suffix = it->path().generic_u8string().substr(prefix_length + 1);
+            auto target = paths.installed / target_triplet_as_string / suffix;
+
+            auto status = it->status(ec);
+            if (ec)
+            {
+                System::println(System::color::error, "failed: %s: %s", it->path().u8string(), ec.message());
+                continue;
+            }
+            if (fs::is_directory(status))
+            {
+                fs::create_directory(target, ec);
+                if (ec)
+                {
+                    System::println(System::color::error, "failed: %s: %s", target.u8string(), ec.message());
+                }
+
+                listfile << target_triplet << "/" << suffix << "\n";
+            }
+            else if (fs::is_regular_file(status))
+            {
+                fs::copy_file(*it, target, ec);
+                if (ec)
+                {
+                    System::println(System::color::error, "failed: %s: %s", target.u8string(), ec.message());
+                }
+                listfile << target_triplet << "/" << suffix << "\n";
+            }
+            else if (!fs::status_known(status))
+            {
+                System::println(System::color::error, "failed: %s: unknown status", it->path().u8string());
+            }
+            else
+                System::println(System::color::error, "failed: %s: cannot handle file type", it->path().u8string());
+        }
+
+        listfile.close();
+    }
+
+    static void remove_first_n_chars(std::vector<std::string>* strings, const size_t n)
+    {
+        for (std::string& s : *strings)
+        {
+            s.erase(0, n);
+        }
+    };
+
+    static std::vector<std::string> extract_files_in_triplet(const std::vector<StatusParagraph_and_associated_files>& pgh_and_files, const triplet& triplet)
+    {
+        std::vector<std::string> output;
+        for (const StatusParagraph_and_associated_files& t : pgh_and_files)
+        {
+            if (t.pgh.package.spec.target_triplet() != triplet)
+            {
+                continue;
+            }
+
+            output.insert(output.end(), t.files.cbegin(), t.files.cend());
+        }
+
+        std::sort(output.begin(), output.end());
+        return output;
+    }
+
+    void install_package(const vcpkg_paths& paths, const BinaryParagraph& binary_paragraph, StatusParagraphs& status_db)
+    {
+        const fs::path package_dir = paths.package_dir(binary_paragraph.spec);
+        const std::vector<fs::path> package_file_paths = Files::recursive_find_all_files_in_dir(package_dir);
+        std::vector<std::string> package_files;
+        const size_t package_remove_char_count = package_dir.generic_string().size() + 1; // +1 for the slash
+        std::transform(package_file_paths.cbegin(), package_file_paths.cend(), std::back_inserter(package_files), [package_remove_char_count](const fs::path& path)
+                       {
+                           return path.generic_string().erase(0, package_remove_char_count);
+                       });
+        std::sort(package_files.begin(), package_files.end());
+
+        const std::vector<StatusParagraph_and_associated_files>& pgh_and_files = get_installed_files(paths, status_db);
+        const triplet& triplet = binary_paragraph.spec.target_triplet();
+        std::vector<std::string> installed_files = extract_files_in_triplet(pgh_and_files, triplet);
+        const size_t installed_remove_char_count = triplet.canonical_name().size() + 1; // +1 for the slash
+        remove_first_n_chars(&installed_files, installed_remove_char_count);
+        std::sort(installed_files.begin(), installed_files.end()); // Should already be sorted
+
+        std::vector<std::string> intersection;
+        std::set_intersection(package_files.cbegin(), package_files.cend(),
+                              installed_files.cbegin(), installed_files.cend(),
+                              std::back_inserter(intersection));
+
+        if (!intersection.empty())
+        {
+            const fs::path triplet_install_path = paths.installed / triplet.canonical_name();
+            System::println(System::color::error, "The following files are already installed in %s and are in conflict with %s",
+                            triplet_install_path.generic_string(),
+                            binary_paragraph.spec);
+            System::println("");
+            for (const std::string& s : intersection)
+            {
+                System::println("    %s", s);
+            }
+            System::println("");
+            exit(EXIT_FAILURE);
+        }
+
+        StatusParagraph spgh;
+        spgh.package = binary_paragraph;
+        spgh.want = want_t::install;
+        spgh.state = install_state_t::half_installed;
+        for (auto&& dep : spgh.package.depends)
+        {
+            if (status_db.find_installed(dep, spgh.package.spec.target_triplet()) == status_db.end())
+            {
+                Checks::unreachable();
+            }
+        }
+        write_update(paths, spgh);
+        status_db.insert(std::make_unique<StatusParagraph>(spgh));
+
+        install_and_write_listfile(paths, spgh.package);
+
+        spgh.state = install_state_t::installed;
+        write_update(paths, spgh);
+        status_db.insert(std::make_unique<StatusParagraph>(spgh));
     }
 
     void install_command(const vcpkg_cmd_arguments& args, const vcpkg_paths& paths, const triplet& default_target_triplet)
@@ -78,49 +221,47 @@ namespace vcpkg
 
         std::vector<package_spec> specs = Input::check_and_get_package_specs(args.command_arguments, default_target_triplet, example.c_str());
         Input::check_triplets(specs, paths);
-        std::vector<package_spec> install_plan = Dependencies::create_dependency_ordered_install_plan(paths, specs, status_db);
+        std::vector<package_spec_with_install_plan> install_plan = Dependencies::create_install_plan(paths, specs, status_db);
         Checks::check_exit(!install_plan.empty(), "Install plan cannot be empty");
-        std::string specs_string = to_string(install_plan[0]);
+
+        std::string specs_string = to_string(install_plan[0].spec);
         for (size_t i = 1; i < install_plan.size(); ++i)
         {
             specs_string.push_back(',');
-            specs_string.append(to_string(install_plan[i]));
+            specs_string.append(to_string(install_plan[i].spec));
         }
         TrackProperty("installplan", specs_string);
         Environment::ensure_utilities_on_path(paths);
 
-        for (const package_spec& spec : install_plan)
+        for (const package_spec_with_install_plan& action : install_plan)
         {
-            if (status_db.find_installed(spec.name(), spec.target_triplet()) != status_db.end())
-            {
-                System::println(System::color::success, "Package %s is already installed", spec);
-                continue;
-            }
-
-            fs::path package_path = paths.package_dir(spec);
-
-            expected<std::string> file_contents = Files::get_contents(package_path / "CONTROL");
-
             try
             {
-                if (file_contents.error_code())
+                if (action.plan.type == install_plan_type::ALREADY_INSTALLED)
                 {
-                    build_internal(spec, paths);
-                    file_contents = Files::get_contents(package_path / "CONTROL");
-                    if (file_contents.error_code())
+                    if (std::find(specs.begin(), specs.end(), action.spec) != specs.end())
                     {
-                        file_contents.get_or_throw();
+                        System::println(System::color::success, "Package %s is already installed", action.spec);
                     }
                 }
-
-                auto pghs = Paragraphs::parse_paragraphs(file_contents.get_or_throw());
-                Checks::check_throw(pghs.size() == 1, "multiple paragraphs in control file");
-                install_package(paths, BinaryParagraph(pghs[0]), status_db);
-                System::println(System::color::success, "Package %s is installed", spec);
+                else if (action.plan.type == install_plan_type::BUILD_AND_INSTALL)
+                {
+                    build_internal(*action.plan.spgh, action.spec, paths, paths.port_dir(action.spec));
+                    const BinaryParagraph bpgh = try_load_cached_package(paths, action.spec).get_or_throw();
+                    install_package(paths, bpgh, status_db);
+                    System::println(System::color::success, "Package %s is installed", action.spec);
+                }
+                else if (action.plan.type == install_plan_type::INSTALL)
+                {
+                    install_package(paths, *action.plan.bpgh, status_db);
+                    System::println(System::color::success, "Package %s is installed", action.spec);
+                }
+                else
+                    Checks::unreachable();
             }
             catch (const std::exception& e)
             {
-                System::println(System::color::error, "Error: Could not install package %s: %s", spec, e.what());
+                System::println(System::color::error, "Error: Could not install package %s: %s", action.spec, e.what());
                 exit(EXIT_FAILURE);
             }
         }
@@ -136,35 +277,55 @@ namespace vcpkg
         // Allowing only 1 package for now.
 
         args.check_exact_arg_count(1, example.c_str());
+
         StatusParagraphs status_db = database_load_check(paths);
 
         const package_spec spec = Input::check_and_get_package_spec(args.command_arguments.at(0), default_target_triplet, example.c_str());
         Input::check_triplet(spec.target_triplet(), paths);
 
+        const std::unordered_set<std::string> options = args.check_and_get_optional_command_arguments({OPTION_CHECKS_ONLY});
+        if (options.find(OPTION_CHECKS_ONLY) != options.end())
+        {
+            PostBuildLint::perform_all_checks(spec, paths);
+            exit(EXIT_SUCCESS);
+        }
+
         // Explicitly load and use the portfile's build dependencies when resolving the build command (instead of a cached package's dependencies).
-        auto first_level_deps = Dependencies::get_unmet_package_build_dependencies(paths, spec);
+        const expected<SourceParagraph> maybe_spgh = try_load_port(paths, spec.name());
+        Checks::check_exit(!maybe_spgh.error_code(), "Could not find package named %s: %s", spec, maybe_spgh.error_code().message());
+        const SourceParagraph& spgh = *maybe_spgh.get();
+
+        const std::vector<std::string> first_level_deps = filter_dependencies(spgh.depends, spec.target_triplet());
+
         std::vector<package_spec> first_level_deps_specs;
-        for (auto&& dep : first_level_deps)
+        for (const std::string& dep : first_level_deps)
         {
             first_level_deps_specs.push_back(package_spec::from_name_and_triplet(dep, spec.target_triplet()).get_or_throw());
         }
 
-        std::unordered_set<package_spec> unmet_dependencies = Dependencies::get_unmet_dependencies(paths, first_level_deps_specs, status_db);
+        std::vector<package_spec_with_install_plan> unmet_dependencies = Dependencies::create_install_plan(paths, first_level_deps_specs, status_db);
+        unmet_dependencies.erase(
+            std::remove_if(unmet_dependencies.begin(), unmet_dependencies.end(), [](const package_spec_with_install_plan& p)
+                           {
+                               return p.plan.type == install_plan_type::ALREADY_INSTALLED;
+                           }),
+            unmet_dependencies.end());
+
         if (!unmet_dependencies.empty())
         {
             System::println(System::color::error, "The build command requires all dependencies to be already installed.");
             System::println("The following dependencies are missing:");
             System::println("");
-            for (const package_spec& p : unmet_dependencies)
+            for (const package_spec_with_install_plan& p : unmet_dependencies)
             {
-                System::println("    %s", to_string(p));
+                System::println("    %s", to_string(p.spec));
             }
             System::println("");
             exit(EXIT_FAILURE);
         }
 
         Environment::ensure_utilities_on_path(paths);
-        build_internal(spec, paths);
+        build_internal(spgh, spec, paths, paths.port_dir(spec));
         exit(EXIT_SUCCESS);
     }
 
@@ -173,17 +334,21 @@ namespace vcpkg
         static const std::string example = create_example_string(R"(build_external zlib2 C:\path\to\dir\with\controlfile\)");
         args.check_exact_arg_count(2, example.c_str());
 
-        expected<package_spec> current_spec = package_spec::from_string(args.command_arguments[0], default_target_triplet);
-        if (auto spec = current_spec.get())
+        expected<package_spec> maybe_current_spec = package_spec::from_string(args.command_arguments[0], default_target_triplet);
+        if (auto spec = maybe_current_spec.get())
         {
             Input::check_triplet(spec->target_triplet(), paths);
             Environment::ensure_utilities_on_path(paths);
             const fs::path port_dir = args.command_arguments.at(1);
-            build_internal(*spec, paths, port_dir);
-            exit(EXIT_SUCCESS);
+            const expected<SourceParagraph> maybe_spgh = try_load_port(port_dir);
+            if (auto spgh = maybe_spgh.get())
+            {
+                build_internal(*spgh, *spec, paths, port_dir);
+                exit(EXIT_SUCCESS);
+            }
         }
 
-        System::println(System::color::error, "Error: %s: %s", current_spec.error_code().message(), args.command_arguments[0]);
+        System::println(System::color::error, "Error: %s: %s", maybe_current_spec.error_code().message(), args.command_arguments[0]);
         print_example(Strings::format("%s zlib:x64-windows", args.command).c_str());
         exit(EXIT_FAILURE);
     }
